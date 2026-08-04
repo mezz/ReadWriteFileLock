@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*.*.*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      - name: Verify with Maven
+        if: runner.os != 'Windows'
+        run: ./mvnw --batch-mode --no-transfer-progress verify
+
+      - name: Verify with Maven
+        if: runner.os == 'Windows'
+        run: ./mvnw.cmd --batch-mode --no-transfer-progress verify
+
+  publish:
+    name: Publish to Maven Central
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: maven-central
+    concurrency:
+      group: maven-central-publish
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Read release version from tag
+        id: version
+        shell: bash
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$release_version" =~ ^[0-9]+(\.[0-9]+){2}(-[A-Za-z0-9][A-Za-z0-9.-]*)?$ ]]; then
+            echo "Tag '$GITHUB_REF_NAME' is not a supported release tag. Use tags like v0.1.0."
+            exit 1
+          fi
+          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java and Maven Central credentials
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Verify project version matches tag
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+        shell: bash
+        run: |
+          pom_version="$(./mvnw --batch-mode --no-transfer-progress help:evaluate -Dexpression=project.version -q -DforceStdout)"
+          if [[ "$pom_version" != "$RELEASE_VERSION" ]]; then
+            echo "Tag '$GITHUB_REF_NAME' resolves to '$RELEASE_VERSION', but pom.xml declares '$pom_version'."
+            exit 1
+          fi
+          if [[ "$pom_version" == *-SNAPSHOT ]]; then
+            echo "Release tags must not publish SNAPSHOT versions."
+            exit 1
+          fi
+
+      - name: Publish to Maven Central
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: ./mvnw --batch-mode --no-transfer-progress -Prelease -Dcentral.autoPublish=true -Dcentral.waitUntil=published deploy
