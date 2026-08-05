@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, Java ${{ matrix.java-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -24,6 +24,12 @@ jobs:
           - ubuntu-latest
           - macos-latest
           - windows-latest
+        java-version:
+          - '8'
+          - '11'
+          - '17'
+          - '21'
+          - '25'
 
     steps:
       - name: Check out repository
@@ -31,8 +37,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Java
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+      - name: Set up test Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+
+      - name: Set up build Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: 17
@@ -40,11 +52,11 @@ jobs:
 
       - name: Verify with Maven
         if: runner.os != 'Windows'
-        run: ./mvnw --batch-mode --no-transfer-progress verify
+        run: ./mvnw --batch-mode --no-transfer-progress -Dtest.runtime.java.version=${{ matrix.java-version }} verify
 
       - name: Verify with Maven
         if: runner.os == 'Windows'
-        run: ./mvnw.cmd --batch-mode --no-transfer-progress verify
+        run: ./mvnw.cmd --batch-mode --no-transfer-progress -Dtest.runtime.java.version=${{ matrix.java-version }} verify
 
   publish:
     name: Publish to Maven Central
@@ -76,7 +88,7 @@ jobs:
           echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Java and Maven Central credentials
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: 17
