@@ -30,7 +30,7 @@ final class LockFile {
      * @throws IOException when opening or locking the file fails
      */
     OpenFileLock lock(boolean shared) throws IOException {
-        var channel = openChannel();
+        FileChannel channel = openChannel();
         try {
             return new OpenFileLock(path, channel.lock(0L, Long.MAX_VALUE, shared));
         } catch (IOException | RuntimeException e) {
@@ -48,7 +48,7 @@ final class LockFile {
      */
     @Nullable
     OpenFileLock tryLock(boolean shared) throws IOException {
-        var channel = openChannel();
+        FileChannel channel = openChannel();
         FileLock lock;
         try {
             lock = channel.tryLock(0L, Long.MAX_VALUE, shared);
@@ -68,7 +68,7 @@ final class LockFile {
     }
 
     private FileChannel openChannel() throws IOException {
-        var parent = path.getParent();
+        Path parent = path.getParent();
         if (parent != null) {
             Files.createDirectories(parent);
         }

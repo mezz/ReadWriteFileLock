@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -67,16 +68,16 @@ public final class ReadWriteFileLock {
      * @return the read/write file lock for the path
      */
     public static ReadWriteFileLock forFile(Path path) {
-        var normalizedLockFile = normalizeLockFile(path);
+        Path normalizedLockFile = normalizeLockFile(path);
         return LOCKS.computeIfAbsent(normalizedLockFile, ReadWriteFileLock::new);
     }
 
     private static Path normalizeLockFile(Path path) {
-        var absolutePath = Objects.requireNonNull(path, "path").toAbsolutePath().normalize();
+        Path absolutePath = Objects.requireNonNull(path, "path").toAbsolutePath().normalize();
         try {
             return absolutePath.toRealPath();
         } catch (NoSuchFileException e) {
-            var parent = absolutePath.getParent();
+            Path parent = absolutePath.getParent();
             if (parent != null) {
                 try {
                     return parent.toRealPath().resolve(absolutePath.getFileName()).normalize();
@@ -115,7 +116,7 @@ public final class ReadWriteFileLock {
      * @throws IOException when locking fails
      */
     public @Nullable HeldLock tryLockForRead() throws IOException {
-        var readLock = jvmLock.readLock();
+        Lock readLock = jvmLock.readLock();
         if (!readLock.tryLock()) {
             return null;
         }
@@ -152,7 +153,7 @@ public final class ReadWriteFileLock {
      * @throws IOException when locking fails
      */
     public @Nullable HeldLock tryLockForWrite() throws IOException {
-        var writeLock = jvmLock.writeLock();
+        Lock writeLock = jvmLock.writeLock();
         if (!writeLock.tryLock()) {
             return null;
         }
@@ -177,7 +178,7 @@ public final class ReadWriteFileLock {
             throw new IllegalStateException("Cannot acquire a write lock while the current thread holds a read lock.");
         }
 
-        var localLock = read ? jvmLock.readLock() : jvmLock.writeLock();
+        Lock localLock = read ? jvmLock.readLock() : jvmLock.writeLock();
         try {
             localLock.lockInterruptibly();
         } catch (InterruptedException e) {
@@ -219,7 +220,7 @@ public final class ReadWriteFileLock {
             }
 
             if (readProcessLock == null) {
-                var processLock = processLockFile.tryLock(true);
+                LockFile.OpenFileLock processLock = processLockFile.tryLock(true);
                 if (processLock == null) {
                     return null;
                 }
@@ -243,7 +244,7 @@ public final class ReadWriteFileLock {
     private @Nullable LockMode tryAcquireWriteLock() throws IOException {
         synchronized (this) {
             if (writeProcessLock == null) {
-                var processLock = processLockFile.tryLock(false);
+                LockFile.OpenFileLock processLock = processLockFile.tryLock(false);
                 if (processLock == null) {
                     return null;
                 }
@@ -256,8 +257,14 @@ public final class ReadWriteFileLock {
 
     private void releaseProcessLock(LockMode lockMode) throws IOException {
         switch (lockMode) {
-            case READ -> releaseReadLock();
-            case WRITE -> releaseWriteLock();
+            case READ:
+                releaseReadLock();
+                break;
+            case WRITE:
+                releaseWriteLock();
+                break;
+            default:
+                throw new AssertionError(lockMode);
         }
     }
 
@@ -270,7 +277,7 @@ public final class ReadWriteFileLock {
             }
 
             if (readProcessLockHolders == 0) {
-                var lockToClose = readProcessLock;
+                LockFile.OpenFileLock lockToClose = readProcessLock;
                 if (lockToClose == null) {
                     throw new IllegalStateException("No read file lock is held.");
                 }
@@ -289,7 +296,7 @@ public final class ReadWriteFileLock {
             }
 
             if (writeProcessLockHolders == 0) {
-                var lockToClose = writeProcessLock;
+                LockFile.OpenFileLock lockToClose = writeProcessLock;
                 if (lockToClose == null) {
                     throw new IllegalStateException("No write file lock is held.");
                 }
@@ -311,13 +318,13 @@ public final class ReadWriteFileLock {
      * A lock must be closed by the same thread that acquired it.
      */
     public final class HeldLock implements Closeable {
-        private final java.util.concurrent.locks.Lock localLock;
+        private final Lock localLock;
         private final LockMode lockMode;
         private final Thread ownerThread;
         private boolean closed;
 
         private HeldLock(
-                java.util.concurrent.locks.Lock localLock,
+                Lock localLock,
                 LockMode lockMode
         ) {
             this.localLock = localLock;

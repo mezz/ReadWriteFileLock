@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
@@ -15,12 +16,12 @@ final class ProcessLockClient {
     }
 
     static Result run(Command command, Path lockFile) throws Exception {
-        var javaExecutable = Path.of(
+        Path javaExecutable = Paths.get(
                 System.getProperty("java.home"),
                 "bin",
                 isWindows() ? "java.exe" : "java"
         );
-        var process = new ProcessBuilder(
+        Process process = new ProcessBuilder(
                 javaExecutable.toString(),
                 "-cp",
                 System.getProperty("java.class.path"),
@@ -37,7 +38,7 @@ final class ProcessLockClient {
                 throw new AssertionError("Timed out waiting for process lock client.");
             }
 
-            var output = readProcessOutput(process);
+            String output = readProcessOutput(process);
             if (process.exitValue() != 0) {
                 throw new AssertionError(output);
             }
@@ -52,45 +53,54 @@ final class ProcessLockClient {
             throw new IllegalArgumentException("Usage: ProcessLockClient <command> <lockFile>");
         }
 
-        var command = Command.parse(args[0]);
-        var lockFile = Path.of(args[1]);
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Command command = Command.parse(args[0]);
+        Path lockFile = Paths.get(args[1]);
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
         switch (command) {
-            case TRY_READ -> tryRead(lock);
-            case TRY_WRITE -> tryWrite(lock);
-            case HOLD_READ -> holdRead(lock);
-            case HOLD_WRITE -> holdWrite(lock);
-            default -> throw new IllegalArgumentException("Unknown command: " + command);
+            case TRY_READ:
+                tryRead(lock);
+                break;
+            case TRY_WRITE:
+                tryWrite(lock);
+                break;
+            case HOLD_READ:
+                holdRead(lock);
+                break;
+            case HOLD_WRITE:
+                holdWrite(lock);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown command: " + command);
         }
     }
 
     private static void tryRead(ReadWriteFileLock lock) throws Exception {
-        var heldLock = lock.tryLockForRead();
+        ReadWriteFileLock.HeldLock heldLock = lock.tryLockForRead();
         if (heldLock == null) {
             System.out.println(Result.BUSY);
             return;
         }
 
-        try (heldLock) {
+        try (ReadWriteFileLock.HeldLock ignored = heldLock) {
             System.out.println(Result.LOCKED);
         }
     }
 
     private static void tryWrite(ReadWriteFileLock lock) throws Exception {
-        var heldLock = lock.tryLockForWrite();
+        ReadWriteFileLock.HeldLock heldLock = lock.tryLockForWrite();
         if (heldLock == null) {
             System.out.println(Result.BUSY);
             return;
         }
 
-        try (heldLock) {
+        try (ReadWriteFileLock.HeldLock ignored = heldLock) {
             System.out.println(Result.LOCKED);
         }
     }
 
     private static void holdRead(ReadWriteFileLock lock) throws Exception {
-        try (var ignored = lock.lockForRead()) {
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForRead()) {
             System.out.println("LOCKED");
             System.out.flush();
             System.in.read();
@@ -98,7 +108,7 @@ final class ProcessLockClient {
     }
 
     private static void holdWrite(ReadWriteFileLock lock) throws Exception {
-        try (var ignored = lock.lockForWrite()) {
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForWrite()) {
             System.out.println("LOCKED");
             System.out.flush();
             System.in.read();
@@ -107,13 +117,13 @@ final class ProcessLockClient {
 
     private static String readProcessOutput(Process process) throws IOException {
         try (
-                var input = new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8);
-                var reader = new BufferedReader(input)
+                InputStreamReader input = new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8);
+                BufferedReader reader = new BufferedReader(input)
         ) {
-            var output = new StringBuilder();
+            StringBuilder output = new StringBuilder();
             String line;
             while ((line = reader.readLine()) != null) {
-                if (!output.isEmpty()) {
+                if (output.length() > 0) {
                     output.append(System.lineSeparator());
                 }
                 output.append(line);
@@ -143,7 +153,7 @@ final class ProcessLockClient {
         }
 
         static Command parse(String argument) {
-            for (var command : values()) {
+            for (Command command : values()) {
                 if (command.argument.equals(argument)) {
                     return command;
                 }
@@ -157,7 +167,7 @@ final class ProcessLockClient {
         BUSY;
 
         static Result parse(String output) {
-            var trimmedOutput = output.strip();
+            String trimmedOutput = output.trim();
             try {
                 return valueOf(trimmedOutput);
             } catch (IllegalArgumentException e) {

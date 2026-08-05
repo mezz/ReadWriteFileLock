@@ -10,6 +10,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -33,16 +35,16 @@ class ReadWriteFileLockTest {
 
     @Test
     void forFileReusesNormalizedLockInstance() {
-        var normalized = tempDir.resolve("cache.lock");
-        var withRedundantSegments = tempDir.resolve("nested").resolve("..").resolve("cache.lock");
+        Path normalized = tempDir.resolve("cache.lock");
+        Path withRedundantSegments = tempDir.resolve("nested").resolve("..").resolve("cache.lock");
 
         assertSame(ReadWriteFileLock.forFile(normalized), ReadWriteFileLock.forFile(withRedundantSegments));
     }
 
     @Test
     void forFileReusesLockInstanceForSymlinkedParentWhenSupported() throws Exception {
-        var realDirectory = Files.createDirectory(tempDir.resolve("real"));
-        var symlinkDirectory = tempDir.resolve("link");
+        Path realDirectory = Files.createDirectory(tempDir.resolve("real"));
+        Path symlinkDirectory = tempDir.resolve("link");
         try {
             Files.createSymbolicLink(symlinkDirectory, realDirectory);
         } catch (UnsupportedOperationException | IOException | SecurityException e) {
@@ -57,51 +59,51 @@ class ReadWriteFileLockTest {
 
     @Test
     void allowsMultipleReadLocksInSameJvm() throws Exception {
-        var lock = ReadWriteFileLock.forFile(tempDir.resolve("read.lock"));
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(tempDir.resolve("read.lock"));
 
         try (
-                var first = lock.lockForRead();
-                var second = lock.lockForRead();
-                var third = lock.tryLockForRead()
+                ReadWriteFileLock.HeldLock first = lock.lockForRead();
+                ReadWriteFileLock.HeldLock second = lock.lockForRead();
+                ReadWriteFileLock.HeldLock third = lock.tryLockForRead()
         ) {
             assertNotNull(third);
             assertNull(lock.tryLockForWrite());
         }
 
-        try (var write = lock.tryLockForWrite()) {
+        try (ReadWriteFileLock.HeldLock write = lock.tryLockForWrite()) {
             assertNotNull(write);
         }
     }
 
     @Test
     void allowsReentrantWriteLocksInSameThread() throws Exception {
-        var lock = ReadWriteFileLock.forFile(tempDir.resolve("reentrant-write.lock"));
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(tempDir.resolve("reentrant-write.lock"));
 
         try (
-                var first = lock.lockForWrite();
-                var second = lock.lockForWrite()
+                ReadWriteFileLock.HeldLock first = lock.lockForWrite();
+                ReadWriteFileLock.HeldLock second = lock.lockForWrite()
         ) {
-            try (var read = lock.tryLockForRead()) {
+            try (ReadWriteFileLock.HeldLock read = lock.tryLockForRead()) {
                 assertNotNull(read);
             }
         }
 
-        try (var write = lock.tryLockForWrite()) {
+        try (ReadWriteFileLock.HeldLock write = lock.tryLockForWrite()) {
             assertNotNull(write);
         }
     }
 
     @Test
     void allowsReadLockWhileCurrentThreadHoldsWriteLock() throws Exception {
-        var lockFile = tempDir.resolve("write-then-read.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("write-then-read.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
         ReadWriteFileLock.HeldLock read;
-        try (var write = lock.lockForWrite()) {
+        try (ReadWriteFileLock.HeldLock write = lock.lockForWrite()) {
             read = lock.lockForRead();
         }
 
-        try (read) {
+        try (ReadWriteFileLock.HeldLock ignored = read) {
             assertEquals(BUSY, ProcessLockClient.run(TRY_WRITE, lockFile));
         }
         assertEquals(LOCKED, ProcessLockClient.run(TRY_WRITE, lockFile));
@@ -109,9 +111,9 @@ class ReadWriteFileLockTest {
 
     @Test
     void lockForWriteFailsFastWhenCurrentThreadHoldsReadLock() throws Exception {
-        var lock = ReadWriteFileLock.forFile(tempDir.resolve("upgrade.lock"));
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(tempDir.resolve("upgrade.lock"));
 
-        try (var ignored = lock.lockForRead()) {
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForRead()) {
             assertThrows(IllegalStateException.class, lock::lockForWrite);
             assertNull(lock.tryLockForWrite());
         }
@@ -119,11 +121,11 @@ class ReadWriteFileLockTest {
 
     @Test
     void tryLockForReadReturnsNullWhenWriteLockIsHeldByAnotherThread() throws Exception {
-        var lock = ReadWriteFileLock.forFile(tempDir.resolve("try-read.lock"));
-        var executor = Executors.newSingleThreadExecutor();
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(tempDir.resolve("try-read.lock"));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
 
-        try (var ignored = lock.lockForWrite()) {
-            var result = executor.submit(lock::tryLockForRead);
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForWrite()) {
+            Future<ReadWriteFileLock.HeldLock> result = executor.submit(() -> lock.tryLockForRead());
 
             assertNull(result.get(1, TimeUnit.SECONDS));
         } finally {
@@ -134,19 +136,19 @@ class ReadWriteFileLockTest {
 
     @Test
     void readLockWaitsForWriteLock() throws Exception {
-        var lock = ReadWriteFileLock.forFile(tempDir.resolve("waiting.lock"));
-        var executor = Executors.newSingleThreadExecutor();
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(tempDir.resolve("waiting.lock"));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
 
         try {
-            var taskStarted = new CountDownLatch(1);
-            var readAcquired = new CountDownLatch(1);
-            var releaseRead = new CountDownLatch(1);
+            CountDownLatch taskStarted = new CountDownLatch(1);
+            CountDownLatch readAcquired = new CountDownLatch(1);
+            CountDownLatch releaseRead = new CountDownLatch(1);
             Future<?> readFuture;
 
-            try (var write = lock.lockForWrite()) {
+            try (ReadWriteFileLock.HeldLock write = lock.lockForWrite()) {
                 readFuture = executor.submit(() -> {
                     taskStarted.countDown();
-                    try (var ignored = lock.lockForRead()) {
+                    try (ReadWriteFileLock.HeldLock ignored = lock.lockForRead()) {
                         readAcquired.countDown();
                         if (!releaseRead.await(1, TimeUnit.SECONDS)) {
                             throw new TimeoutException("Timed out waiting to release read lock.");
@@ -170,30 +172,30 @@ class ReadWriteFileLockTest {
 
     @Test
     void tryLockForReadReturnsNullWhenOperatingSystemFileLockIsHeldForWriting() throws Exception {
-        var lockFile = tempDir.resolve("try-read-os.lock");
+        Path lockFile = tempDir.resolve("try-read-os.lock");
         Files.createFile(lockFile);
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
         try (
-                var channel = FileChannel.open(lockFile, StandardOpenOption.READ, StandardOpenOption.WRITE);
-                var ignored = channel.lock(0L, Long.MAX_VALUE, false)
+                FileChannel channel = FileChannel.open(lockFile, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                java.nio.channels.FileLock ignored = channel.lock(0L, Long.MAX_VALUE, false)
         ) {
             assertNull(lock.tryLockForRead());
         }
 
-        try (var read = lock.tryLockForRead()) {
+        try (ReadWriteFileLock.HeldLock read = lock.tryLockForRead()) {
             assertNotNull(read);
         }
     }
 
     @Test
     void writeLockHoldsOperatingSystemFileLock() throws Exception {
-        var lockFile = tempDir.resolve("operating-system.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("operating-system.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
         try (
-                var ignored = lock.lockForWrite();
-                var channel = FileChannel.open(lockFile, StandardOpenOption.READ, StandardOpenOption.WRITE)
+                ReadWriteFileLock.HeldLock ignored = lock.lockForWrite();
+                FileChannel channel = FileChannel.open(lockFile, StandardOpenOption.READ, StandardOpenOption.WRITE)
         ) {
             assertThrows(
                     OverlappingFileLockException.class,
@@ -204,11 +206,11 @@ class ReadWriteFileLockTest {
 
     @Test
     void readLockHoldsOperatingSystemFileLockUntilLastLocalReadLockCloses() throws Exception {
-        var lockFile = tempDir.resolve("last-read.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("last-read.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
-        try (var second = lock.lockForRead()) {
-            try (var first = lock.lockForRead()) {
+        try (ReadWriteFileLock.HeldLock second = lock.lockForRead()) {
+            try (ReadWriteFileLock.HeldLock first = lock.lockForRead()) {
                 assertNotNull(first);
             }
             assertEquals(BUSY, ProcessLockClient.run(TRY_WRITE, lockFile));
@@ -218,10 +220,10 @@ class ReadWriteFileLockTest {
 
     @Test
     void readLocksCoordinateAcrossProcesses() throws Exception {
-        var lockFile = tempDir.resolve("process-read.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("process-read.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
-        try (var ignored = lock.lockForRead()) {
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForRead()) {
             assertEquals(LOCKED, ProcessLockClient.run(TRY_READ, lockFile));
             assertEquals(BUSY, ProcessLockClient.run(TRY_WRITE, lockFile));
         }
@@ -231,10 +233,10 @@ class ReadWriteFileLockTest {
 
     @Test
     void writeLocksCoordinateAcrossProcesses() throws Exception {
-        var lockFile = tempDir.resolve("process-write.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("process-write.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
-        try (var ignored = lock.lockForWrite()) {
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForWrite()) {
             assertEquals(BUSY, ProcessLockClient.run(TRY_READ, lockFile));
             assertEquals(BUSY, ProcessLockClient.run(TRY_WRITE, lockFile));
         }
@@ -245,63 +247,63 @@ class ReadWriteFileLockTest {
 
     @Test
     void closeFromDifferentThreadDoesNotReleaseReadLock() throws Exception {
-        var lockFile = tempDir.resolve("wrong-thread-read.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("wrong-thread-read.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
-        try (var read = lock.lockForRead()) {
+        try (ReadWriteFileLock.HeldLock read = lock.lockForRead()) {
             assertCloseFromDifferentThreadFails(read);
             assertEquals(BUSY, ProcessLockClient.run(TRY_WRITE, lockFile));
         }
-        try (var write = lock.tryLockForWrite()) {
+        try (ReadWriteFileLock.HeldLock write = lock.tryLockForWrite()) {
             assertNotNull(write);
         }
     }
 
     @Test
     void closeFromDifferentThreadDoesNotReleaseWriteLock() throws Exception {
-        var lockFile = tempDir.resolve("wrong-thread-write.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("wrong-thread-write.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
-        try (var write = lock.lockForWrite()) {
+        try (ReadWriteFileLock.HeldLock write = lock.lockForWrite()) {
             assertCloseFromDifferentThreadFails(write);
             assertEquals(BUSY, ProcessLockClient.run(TRY_READ, lockFile));
         }
-        try (var read = lock.tryLockForRead()) {
+        try (ReadWriteFileLock.HeldLock read = lock.tryLockForRead()) {
             assertNotNull(read);
         }
     }
 
     @Test
     void createsParentDirectoriesAndLockFile() throws Exception {
-        var lockFile = tempDir.resolve("locks").resolve("nested.lock");
-        var lock = ReadWriteFileLock.forFile(lockFile);
+        Path lockFile = tempDir.resolve("locks").resolve("nested.lock");
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
 
-        try (var ignored = lock.lockForWrite()) {
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForWrite()) {
             assertTrue(Files.exists(lockFile));
         }
     }
 
     @Test
     void lockCloseIsIdempotent() throws Exception {
-        var lock = ReadWriteFileLock.forFile(tempDir.resolve("idempotent.lock"));
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(tempDir.resolve("idempotent.lock"));
 
-        var held = lock.lockForWrite();
+        ReadWriteFileLock.HeldLock held = lock.lockForWrite();
         held.close();
         held.close();
 
-        try (var ignored = lock.lockForWrite()) {
+        try (ReadWriteFileLock.HeldLock ignored = lock.lockForWrite()) {
             assertNotNull(ignored);
         }
     }
 
     private static void assertCloseFromDifferentThreadFails(ReadWriteFileLock.HeldLock lock) throws Exception {
-        var executor = Executors.newSingleThreadExecutor();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
-            var result = executor.submit(() -> {
+            Future<?> result = executor.submit(() -> {
                 lock.close();
                 return null;
             });
-            var exception = assertThrows(java.util.concurrent.ExecutionException.class, () -> result.get(1, TimeUnit.SECONDS));
+            ExecutionException exception = assertThrows(ExecutionException.class, () -> result.get(1, TimeUnit.SECONDS));
             assertTrue(exception.getCause() instanceof IllegalMonitorStateException);
         } finally {
             executor.shutdownNow();
