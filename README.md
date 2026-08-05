@@ -13,6 +13,9 @@ share one process file lock and keeps a holder count for it.
 
 ## Usage
 
+The examples below use modern Java syntax. For Java 8 source-compatible
+examples, see [Usage with Java 8](JAVA_8_USAGE.md).
+
 ```java
 import net.mezzdev.readwritefilelock.ReadWriteFileLock;
 
