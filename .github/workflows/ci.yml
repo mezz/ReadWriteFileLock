@@ -22,6 +22,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
+          - macos-15-intel
           - macos-latest
           - windows-latest
         java-version:
@@ -30,6 +31,10 @@ jobs:
           - '17'
           - '21'
           - '25'
+        exclude:
+          # macos-latest is currently arm64, and Temurin does not publish a Java 8 JDK for macOS arm64.
+          - os: macos-latest
+            java-version: '8'
 
     steps:
       - name: Check out repository
@@ -56,7 +61,7 @@ jobs:
 
       - name: Verify with Maven
         if: runner.os == 'Windows'
-        run: ./mvnw.cmd --batch-mode --no-transfer-progress -Dtest.runtime.java.version=${{ matrix.java-version }} verify
+        run: ./mvnw.cmd --batch-mode --no-transfer-progress "-Dtest.runtime.java.version=${{ matrix.java-version }}" verify
 
   publish:
     name: Publish to Maven Central

@@ -6,7 +6,7 @@
 
     <groupId>net.mezzdev</groupId>
     <artifactId>readwritefilelock</artifactId>
-    <version>0.2.0</version>
+    <version>0.2.1</version>
     <packaging>jar</packaging>
 
     <name>ReadWriteFileLock</name>
@@ -32,7 +32,7 @@
         <connection>scm:git:https://github.com/mezz/ReadWriteFileLock.git</connection>
         <developerConnection>scm:git:git@github.com:mezz/ReadWriteFileLock.git</developerConnection>
         <url>https://github.com/mezz/ReadWriteFileLock</url>
-        <tag>v0.2.0</tag>
+        <tag>v0.2.1</tag>
     </scm>
 
     <issueManagement>
