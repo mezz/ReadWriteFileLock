@@ -1,15 +1,7 @@
 # ReadWriteFileLock
 
-A Java read/write lock backed by a file lock, so it works across processes.
-
-The lock has two layers:
-
-- a JVM-local read/write lock with fair scheduling to coordinate threads in the current process;
-- an operating-system file lock to coordinate separate processes.
-
-Java does not allow overlapping file locks on the same file in one JVM process.
-To support multiple readers in one process, `ReadWriteFileLock` lets readers
-share one process file lock and keeps a holder count for it.
+A small Java 8+ read/write lock for coordinating access across threads,
+isolated classloaders, and processes.
 
 ## Usage
 
@@ -21,6 +13,7 @@ import net.mezzdev.readwritefilelock.ReadWriteFileLock;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.concurrent.TimeUnit;
 
 Path lockFile = Paths.get("cache-use.lock");
 ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
@@ -46,6 +39,13 @@ if (writeLock != null) {
         // Write work that should be skipped if the lock is already held.
     }
 }
+
+var timedWriteLock = lock.tryLockForWrite(1, TimeUnit.MINUTES);
+if (timedWriteLock != null) {
+    try (timedWriteLock) {
+        // Write work after waiting up to one minute for the lock.
+    }
+}
 ```
 
 The lock file may remain on disk after use. The active lock is tied to the
@@ -54,6 +54,19 @@ dies, the operating system closes the handle and releases the lock.
 
 A held lock must be closed by the same thread that acquired it. Closing a lock
 more than once from the owning thread is allowed.
+
+## Locking behavior
+
+Each lock combines a fair, classloader-local read/write lock with an operating-
+system file lock. Readers in one classloader share the same process file lock,
+while the operating-system lock coordinates processes and isolated
+classloaders.
+
+Blocking acquisition waits interruptibly and uses `FileChannel.lock()` for
+cross-process contention without polling. Same-JVM file-lock overlap waits for
+a release notification, with a one-second fallback before retrying.
+Timed acquisition applies one timeout across both locking layers and uses
+exponential backoff when polling another process.
 
 ## Comparison with existing options
 
@@ -65,7 +78,7 @@ specific lock file.
 
 | Project | Best fit | Pros | Cons |
 | --- | --- | --- | --- |
-| [ReadWriteFileLock] | Small libraries and tools that need a direct `Path`-based read/write lock. | Minimal API, Java 8+, no logging/container dependencies, same-JVM reader coordination, process coordination through `FileLock`. | Narrow scope; no timed waits, lock upgrades, diagnostics, or lock-file cleanup policy. |
+| [ReadWriteFileLock] | Small libraries and tools that need a direct `Path`-based read/write lock. | Minimal API, Java 8+, no logging/container dependencies, same-classloader reader coordination, process and isolated-classloader coordination through `FileLock`. | Narrow scope; no lock upgrades, diagnostics, or lock-file cleanup policy. |
 | [Java FileLock] | Low-level file locking when the caller manages all coordination. | Built into the JDK, supports both lock modes at the OS level. | File locks are VM-wide; Java does not allow overlapping locks on the same file in one JVM, so callers must add their own thread-level coordination. |
 | [Maven Resolver Named Locks] | Maven/Resolver-style named resource locking. | Actively maintained, supports read/write-style named locks, includes file-lock and other providers. | The API is a named-lock abstraction rather than a direct read/write file-lock utility, and it brings Resolver-oriented concepts/dependencies. |
 | [Takari FileLock] | Older Aether/Maven-style file locking. | Similar read/write idea, uses a sidecar lock file, handles same-JVM coordination. | Old project, older dependency style, and a less direct modern `Path`/try-with-resources API. |
@@ -76,7 +89,7 @@ specific lock file.
 
 | Project | Java support | Lock target | Read/write modes | Same-JVM coordination | Cross-process coordination | Non-blocking acquire | Timed acquire | Standalone library |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [ReadWriteFileLock] | Java 8+ | `Path` | Yes | Yes | Yes | Yes | No | Yes |
+| [ReadWriteFileLock] | Java 8+ | `Path` | Yes | Yes | Yes | Yes | Yes | Yes |
 | [Java FileLock] | Java 1.4+ | `FileChannel` | Yes | No | Yes | Yes | No | JDK<sup><a href="#feature-note-jdk">1</a></sup> |
 | [Maven Resolver Named Locks] | Java 8+ | Named URI | Yes | Yes | Provider-dependent<sup><a href="#feature-note-provider-dependent">2</a></sup> | Yes | Yes | Yes |
 | [Takari FileLock] | Java 6+ | `File` | Yes | Yes | Yes | No | No | Yes |

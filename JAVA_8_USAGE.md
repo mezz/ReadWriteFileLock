@@ -9,6 +9,7 @@ import net.mezzdev.readwritefilelock.ReadWriteFileLock;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.concurrent.TimeUnit;
 
 Path lockFile = Paths.get("cache-use.lock");
 ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
@@ -32,6 +33,13 @@ ReadWriteFileLock.HeldLock writeLock = lock.tryLockForWrite();
 if (writeLock != null) {
     try (ReadWriteFileLock.HeldLock ignored = writeLock) {
         // Write work that should be skipped if the lock is already held.
+    }
+}
+
+ReadWriteFileLock.HeldLock timedWriteLock = lock.tryLockForWrite(1, TimeUnit.MINUTES);
+if (timedWriteLock != null) {
+    try (ReadWriteFileLock.HeldLock ignored = timedWriteLock) {
+        // Write work after waiting up to one minute for the lock.
     }
 }
 ```
