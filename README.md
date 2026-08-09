@@ -128,7 +128,7 @@ ReadWriteFileLock is published to Maven Central:
 <dependency>
     <groupId>net.mezzdev</groupId>
     <artifactId>readwritefilelock</artifactId>
-    <version>0.3.0</version>
+    <version>0.3.1</version>
 </dependency>
 ```
 
