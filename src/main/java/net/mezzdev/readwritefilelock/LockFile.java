@@ -5,6 +5,8 @@ import org.jspecify.annotations.Nullable;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.nio.channels.AsynchronousFileChannel;
+import java.nio.channels.Channel;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -12,7 +14,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Objects;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Represents a file used for inter-process locking.
@@ -23,16 +28,6 @@ final class LockFile {
      * this class a JVM-wide monitor for the same normalized lock-file path.
      */
     private static final String OVERLAP_MONITOR_PREFIX = "net.mezzdev.readwritefilelock.LockFile:";
-
-    /**
-     * Initial delay between file-lock attempts during timed cross-process contention.
-     */
-    private static final long INITIAL_RETRY_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(10L);
-
-    /**
-     * Maximum delay between file-lock attempts during timed cross-process contention.
-     */
-    private static final long MAX_RETRY_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
 
     /**
      * Maximum time to await a same-JVM release notification before retrying.
@@ -70,12 +65,23 @@ final class LockFile {
      * @throws IOException when opening or locking the file fails, or the thread is interrupted
      */
     OpenFileLock lock(boolean shared) throws IOException {
+        boolean firstAttempt = true;
+
         while (true) {
             checkInterrupted();
 
             try {
+                if (firstAttempt) {
+                    firstAttempt = false;
+                    OpenFileLock lock = tryLockOnce(shared);
+                    if (lock != null) {
+                        return lock;
+                    }
+                }
+
                 return lockBlockingOnce(shared);
             } catch (OverlappingFileLockException e) {
+                firstAttempt = false;
                 OpenFileLock lock = waitForJvmOverlap(shared, OVERLAP_NOTIFICATION_FALLBACK_NANOS);
                 if (lock != null) {
                     return lock;
@@ -85,11 +91,47 @@ final class LockFile {
     }
 
     private OpenFileLock lockBlockingOnce(boolean shared) throws IOException {
-        FileChannel channel = openChannel();
+        return lockAsynchronously(shared, null);
+    }
+
+    /**
+     * Acquires the operating-system lock without entering {@link FileChannel#lock(long, long, boolean)}.
+     * <p>
+     * A contended {@code FileChannel.lock()} cannot be interrupted on Windows; see
+     * <a href="https://bugs.openjdk.org/browse/JDK-8152085">JDK-8152085</a>.
+     * {@link AsynchronousFileChannel} uses overlapped I/O on Windows, allowing this
+     * thread to wait interruptibly on the returned future instead.
+     *
+     * @param shared whether the lock should be shared or exclusive
+     * @param timeoutNanos the timeout in nanoseconds, or {@code null} to wait indefinitely
+     * @return the held file lock, or {@code null} when the timeout expires
+     * @throws IOException when opening or locking the file fails, or the thread is interrupted
+     */
+    private @Nullable OpenFileLock lockAsynchronously(boolean shared, @Nullable Long timeoutNanos) throws IOException {
+        AsynchronousFileChannel channel = openAsynchronousChannel();
         try {
-            return new OpenFileLock(path, channel.lock(0L, Long.MAX_VALUE, shared), overlapMonitor);
-        } catch (IOException | RuntimeException e) {
-            channel.close();
+            Future<FileLock> pendingLock = channel.lock(0L, Long.MAX_VALUE, shared);
+            FileLock lock;
+            try {
+                lock = timeoutNanos == null
+                        ? pendingLock.get()
+                        : pendingLock.get(timeoutNanos, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                InterruptedIOException failure = interruptedIOException(e);
+                closeAfterFailure(channel, failure);
+                throw failure;
+            } catch (ExecutionException e) {
+                IOException failure = lockFailure(e);
+                closeAfterFailure(channel, failure);
+                throw failure;
+            } catch (TimeoutException e) {
+                channel.close();
+                return null;
+            }
+
+            return new OpenFileLock(path, channel, lock, overlapMonitor);
+        } catch (RuntimeException | Error e) {
+            closeAfterFailure(channel, e);
             throw e;
         }
     }
@@ -124,7 +166,7 @@ final class LockFile {
             channel.close();
             return null;
         }
-        return new OpenFileLock(path, lock, overlapMonitor);
+        return new OpenFileLock(path, channel, lock, overlapMonitor);
     }
 
     /**
@@ -138,23 +180,27 @@ final class LockFile {
     @Nullable
     OpenFileLock tryLock(boolean shared, long timeoutNanos) throws IOException {
         long startNanos = System.nanoTime();
-        long retryDelayNanos = INITIAL_RETRY_DELAY_NANOS;
         boolean firstAttempt = true;
 
         while (true) {
-            if (!firstAttempt && remainingNanos(startNanos, timeoutNanos) == 0L) {
-                return null;
-            }
-            firstAttempt = false;
-
             checkInterrupted();
 
             try {
-                OpenFileLock lock = tryLockOnce(shared);
-                if (lock != null) {
-                    return lock;
+                if (firstAttempt) {
+                    firstAttempt = false;
+                    OpenFileLock lock = tryLockOnce(shared);
+                    if (lock != null) {
+                        return lock;
+                    }
                 }
+
+                long remainingNanos = remainingNanos(startNanos, timeoutNanos);
+                if (remainingNanos == 0L) {
+                    return null;
+                }
+                return lockAsynchronously(shared, remainingNanos);
             } catch (OverlappingFileLockException e) {
+                firstAttempt = false;
                 long remainingNanos = remainingNanos(startNanos, timeoutNanos);
                 if (remainingNanos == 0L) {
                     return null;
@@ -167,16 +213,7 @@ final class LockFile {
                 if (lock != null) {
                     return lock;
                 }
-                continue;
             }
-
-            long remainingNanos = remainingNanos(startNanos, timeoutNanos);
-            if (remainingNanos == 0L) {
-                return null;
-            }
-
-            waitForRetry(Math.min(retryDelayNanos, remainingNanos));
-            retryDelayNanos = nextRetryDelayNanos(retryDelayNanos);
         }
     }
 
@@ -187,16 +224,12 @@ final class LockFile {
             // Re-attempt while holding the monitor so a release notification cannot be lost
             // between observing JVM contention and starting to wait.
             try {
-				return tryLockOnce(shared);
-			} catch (OverlappingFileLockException e) {
+                return tryLockOnce(shared);
+            } catch (OverlappingFileLockException e) {
                 waitForOverlapNotification(waitNanos);
                 return null;
             }
         }
-    }
-
-    private static long nextRetryDelayNanos(long retryDelayNanos) {
-        return Math.min(retryDelayNanos * 2L, MAX_RETRY_DELAY_NANOS);
     }
 
     private static long remainingNanos(long startNanos, long timeoutNanos) {
@@ -214,16 +247,6 @@ final class LockFile {
     private void checkInterrupted() throws InterruptedIOException {
         if (Thread.currentThread().isInterrupted()) {
             throw new InterruptedIOException("Interrupted while waiting for file lock: " + path);
-        }
-    }
-
-    private void waitForRetry(long delayNanos) throws InterruptedIOException {
-        long delayMillis = TimeUnit.NANOSECONDS.toMillis(delayNanos);
-        int nanoAdjustment = (int) (delayNanos - TimeUnit.MILLISECONDS.toNanos(delayMillis));
-        try {
-            Thread.sleep(delayMillis, nanoAdjustment);
-        } catch (InterruptedException e) {
-            throw interruptedIOException(e);
         }
     }
 
@@ -246,11 +269,24 @@ final class LockFile {
         return exception;
     }
 
-    private FileChannel openChannel() throws IOException {
-        Path parent = path.getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
+    private IOException lockFailure(ExecutionException exception) {
+        Throwable cause = exception.getCause();
+        if (cause instanceof IOException) {
+            return (IOException) cause;
         }
+        return new IOException("Failed to acquire file lock: " + path, cause);
+    }
+
+    private static void closeAfterFailure(Channel channel, Throwable failure) {
+        try {
+            channel.close();
+        } catch (IOException closeFailure) {
+            failure.addSuppressed(closeFailure);
+        }
+    }
+
+    private FileChannel openChannel() throws IOException {
+        createParentDirectories();
 
         return FileChannel.open(
                 path,
@@ -260,6 +296,24 @@ final class LockFile {
         );
     }
 
+    private AsynchronousFileChannel openAsynchronousChannel() throws IOException {
+        createParentDirectories();
+
+        return AsynchronousFileChannel.open(
+                path,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE
+        );
+    }
+
+    private void createParentDirectories() throws IOException {
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+    }
+
     @Override
     public String toString() {
         return path.toString();
@@ -267,6 +321,7 @@ final class LockFile {
 
     static final class OpenFileLock implements Closeable {
         private final Path path;
+        private final Channel channel;
         private final FileLock lock;
 
         /**
@@ -274,8 +329,9 @@ final class LockFile {
          */
         private final Object overlapMonitor;
 
-        private OpenFileLock(Path path, FileLock lock, Object overlapMonitor) {
+        private OpenFileLock(Path path, Channel channel, FileLock lock, Object overlapMonitor) {
             this.path = path;
+            this.channel = channel;
             this.lock = lock;
             this.overlapMonitor = overlapMonitor;
         }
@@ -286,7 +342,7 @@ final class LockFile {
                 try {
                     lock.release();
                 } finally {
-                    lock.channel().close();
+                    channel.close();
                 }
             } finally {
                 synchronized (overlapMonitor) {

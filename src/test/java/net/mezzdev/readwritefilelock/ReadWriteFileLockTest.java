@@ -2,6 +2,8 @@ package net.mezzdev.readwritefilelock;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -444,31 +446,71 @@ class ReadWriteFileLockTest {
         assertEquals(LOCKED, ProcessLockClient.run(TRY_WRITE, lockFile));
     }
 
-    @Test
-    void blockingLocksWaitForContendingProcesses() throws Exception {
-        // Setup: another process holds a conflicting write or read lock.
-        // Operation: start the corresponding blocking local acquisition, then release the process lock.
-        // Assertions: the helper verifies native waiting followed by successful acquisition.
-        assertBlockingLockWaitsForProcess(HOLD_WRITE, true, "blocking-process-write-read.lock");
-        assertBlockingLockWaitsForProcess(HOLD_READ, false, "blocking-process-read-write.lock");
+    @ParameterizedTest(name = "holder={0}, attemptedRead={1}")
+    @CsvSource({
+            "HOLD_WRITE, true",
+            "HOLD_READ, false"
+    })
+    void blockingLockWaitsForContendingProcess(
+            ProcessLockClient.Command holdCommand,
+            boolean attemptedRead
+    ) throws Exception {
+        // Setup: another process holds a lock that conflicts with the requested read or write mode.
+        // Operation: start blocking local acquisition, then release the process lock.
+        // Assertions: asynchronous waiting completes after release in both lock directions.
+        String lockFileName = "blocking-process-" + holdCommand + ".lock";
+        assertBlockingLockWaitsForProcess(holdCommand, attemptedRead, lockFileName);
     }
 
-    @Test
-    void timedLocksWaitForContendingProcessesAndRecoverAfterTimeout() throws Exception {
-        // Setup: another process holds a conflicting write or read lock.
+    @ParameterizedTest(name = "holder={0}, attemptedRead={1}")
+    @CsvSource({
+            "HOLD_WRITE, true",
+            "HOLD_READ, false"
+    })
+    void timedLockWaitsForContendingProcessAndRecoversAfterTimeout(
+            ProcessLockClient.Command holdCommand,
+            boolean attemptedRead
+    ) throws Exception {
+        // Setup: another process holds a lock that conflicts with the requested read or write mode.
         // Operation: perform immediate and timed local attempts before retrying after release.
-        // Assertions: the helper verifies timeout duration, null results, and recovery.
-        assertTimedLockExpiresForProcess(HOLD_WRITE, true, "timed-process-write-read.lock");
-        assertTimedLockExpiresForProcess(HOLD_READ, false, "timed-process-read-write.lock");
+        // Assertions: the deadline expires cleanly and recovery succeeds in both lock directions.
+        String lockFileName = "timed-process-timeout-" + holdCommand + ".lock";
+        assertTimedLockExpiresForProcess(holdCommand, attemptedRead, lockFileName);
     }
 
-    @Test
-    void crossProcessLockWaitsAreInterruptibleAndRecoverable() throws Exception {
-        // Setup: cover blocking and timed local waits behind another process's write lock.
-        // Operation: interrupt each waiting thread before the process releases its lock.
-        // Assertions: the helper verifies interruption status and subsequent lock recovery.
-        assertCrossProcessLockWaitIsInterruptible(false, "interrupt-process-blocking.lock");
-        assertCrossProcessLockWaitIsInterruptible(true, "interrupt-process-timed.lock");
+    @ParameterizedTest(name = "timed={0}, holder={1}, attemptedRead={2}")
+    @CsvSource({
+            "false, HOLD_WRITE, true",
+            "false, HOLD_READ, false",
+            "true, HOLD_WRITE, true",
+            "true, HOLD_READ, false"
+    })
+    void crossProcessLockWaitIsInterruptibleAndRecoverable(
+            boolean timed,
+            ProcessLockClient.Command holdCommand,
+            boolean attemptedRead
+    ) throws Exception {
+        // Setup: another process holds a lock that conflicts with the requested read or write mode.
+        // Operation: interrupt a blocking or timed acquisition before the process releases its lock.
+        // Assertions: interruption returns promptly, preserves status, and leaves the lock reusable.
+        String lockFileName = "interrupt-process-" + timed + "-" + holdCommand + ".lock";
+        assertCrossProcessLockWaitIsInterruptible(timed, holdCommand, attemptedRead, lockFileName);
+    }
+
+    @ParameterizedTest(name = "holder={0}, attemptedRead={1}")
+    @CsvSource({
+            "HOLD_WRITE, true",
+            "HOLD_READ, false"
+    })
+    void timedLockAcquiresAfterContendingProcessReleases(
+            ProcessLockClient.Command holdCommand,
+            boolean attemptedRead
+    ) throws Exception {
+        // Setup: another process holds a lock that conflicts with a timed read or write acquisition.
+        // Operation: release the process lock while the timed acquisition remains pending.
+        // Assertions: asynchronous completion acquires before the deadline in both lock directions.
+        String lockFileName = "timed-process-release-" + holdCommand + ".lock";
+        assertTimedLockAcquiresAfterProcessReleases(holdCommand, attemptedRead, lockFileName);
     }
 
     @Test
@@ -739,8 +781,13 @@ class ReadWriteFileLockTest {
         }
     }
 
-    private void assertCrossProcessLockWaitIsInterruptible(boolean timed, String lockFileName) throws Exception {
-        // Setup: a child process holds a write lock while a local worker prepares to read.
+    private void assertCrossProcessLockWaitIsInterruptible(
+            boolean timed,
+            ProcessLockClient.Command holdCommand,
+            boolean attemptedRead,
+            String lockFileName
+    ) throws Exception {
+        // Setup: a child process holds a conflicting lock while a local worker prepares to wait.
         Path lockFile = tempDir.resolve(lockFileName);
         ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
         AtomicReference<Throwable> result = new AtomicReference<>();
@@ -748,42 +795,109 @@ class ReadWriteFileLockTest {
         CountDownLatch taskStarted = new CountDownLatch(1);
         CountDownLatch taskFinished = new CountDownLatch(1);
 
-        // Operation: start blocking or timed acquisition and interrupt it during process contention.
-        try (ProcessLockClient.HeldProcessLock ignored = ProcessLockClient.hold(HOLD_WRITE, lockFile)) {
-            Thread waitingThread = new Thread(() -> {
-                taskStarted.countDown();
-                try (ReadWriteFileLock.HeldLock unexpected = timed
-                        ? lock.tryLockForRead(5L, TimeUnit.SECONDS)
-                        : lock.lockForRead()) {
-                    result.set(new AssertionError(
-                            unexpected == null
-                                    ? "Timed out instead of being interrupted."
-                                    : "Lock acquisition unexpectedly succeeded."
-                    ));
-                } catch (Throwable e) {
-                    result.set(e);
-                    interruptRestored.set(Thread.currentThread().isInterrupted());
-                } finally {
-                    taskFinished.countDown();
-                }
-            }, timed ? "timed-process-lock-waiter" : "blocking-process-lock-waiter");
+        Thread waitingThread = new Thread(() -> {
+            taskStarted.countDown();
+            try (ReadWriteFileLock.HeldLock unexpected = timed
+                    ? acquireTimed(lock, attemptedRead, 5L, TimeUnit.SECONDS)
+                    : acquireBlocking(lock, attemptedRead)) {
+                result.set(new AssertionError(
+                        unexpected == null
+                                ? "Timed out instead of being interrupted."
+                                : "Lock acquisition unexpectedly succeeded."
+                ));
+            } catch (Throwable e) {
+                result.set(e);
+                interruptRestored.set(Thread.currentThread().isInterrupted());
+            } finally {
+                taskFinished.countDown();
+            }
+        }, timed ? "timed-process-lock-waiter" : "blocking-process-lock-waiter");
+        Thread interruptingThread = new Thread(waitingThread::interrupt, "process-lock-interrupter");
+        interruptingThread.setDaemon(true);
+        ProcessLockClient.HeldProcessLock processLock = ProcessLockClient.hold(holdCommand, lockFile);
 
+        // Operation: start blocking or timed acquisition and interrupt it during process contention.
+        try {
             waitingThread.start();
             assertTrue(taskStarted.await(1, TimeUnit.SECONDS));
             assertFalse(taskFinished.await(100, TimeUnit.MILLISECONDS));
-            waitingThread.interrupt();
-            waitingThread.join(TimeUnit.SECONDS.toMillis(1));
+            interruptingThread.start();
 
-            // Assertions: the waiter exits with an I/O interruption and preserves interrupt status.
-            assertFalse(waitingThread.isAlive());
-            assertInstanceOf(IOException.class, result.get(), String.valueOf(result.get()));
+            // Assertions: the waiter exits while the process still holds the lock.
+            // Interrupting from a separate thread prevents JDK-8152085 from deadlocking the test
+            // controller if synchronous FileChannel.lock() is accidentally reintroduced.
+            assertTrue(taskFinished.await(1L, TimeUnit.SECONDS));
+            interruptingThread.join(TimeUnit.SECONDS.toMillis(1L));
+            assertFalse(interruptingThread.isAlive(), "Thread.interrupt() did not return promptly.");
+            assertInstanceOf(InterruptedIOException.class, result.get(), String.valueOf(result.get()));
             assertTrue(interruptRestored.get());
+        } finally {
+            try {
+                processLock.close();
+            } finally {
+                interruptingThread.join(TimeUnit.SECONDS.toMillis(1L));
+                waitingThread.join(TimeUnit.SECONDS.toMillis(1L));
+            }
         }
 
+        assertFalse(waitingThread.isAlive(), "Interrupted lock acquisition did not terminate.");
+
         // Operation: retry after interruption and release of the process lock.
-        try (ReadWriteFileLock.HeldLock recovered = lock.tryLockForRead(1L, TimeUnit.SECONDS)) {
+        try (ReadWriteFileLock.HeldLock recovered = acquireTimed(
+                lock,
+                attemptedRead,
+                1L,
+                TimeUnit.SECONDS
+        )) {
             // Assertions: interrupted process contention leaves the lock reusable.
             assertNotNull(recovered);
+        }
+    }
+
+    private void assertTimedLockAcquiresAfterProcessReleases(
+            ProcessLockClient.Command holdCommand,
+            boolean attemptedRead,
+            String lockFileName
+    ) throws Exception {
+        // Setup: a child process holds the conflicting lock while a timed worker prepares to acquire.
+        Path lockFile = tempDir.resolve(lockFileName);
+        ReadWriteFileLock lock = ReadWriteFileLock.forFile(lockFile);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CountDownLatch taskStarted = new CountDownLatch(1);
+        ProcessLockClient.HeldProcessLock processLock = ProcessLockClient.hold(holdCommand, lockFile);
+
+        // Operation: start timed acquisition, verify it is pending, and release the child lock.
+        try {
+            Future<Boolean> result = executor.submit(() -> {
+                taskStarted.countDown();
+                ReadWriteFileLock.HeldLock acquired = acquireTimed(
+                        lock,
+                        attemptedRead,
+                        2L,
+                        TimeUnit.SECONDS
+                );
+                if (acquired == null) {
+                    return false;
+                }
+                try (ReadWriteFileLock.HeldLock ignored = acquired) {
+                    return true;
+                }
+            });
+
+            assertTrue(taskStarted.await(1L, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> result.get(100L, TimeUnit.MILLISECONDS));
+
+            processLock.close();
+            processLock = null;
+
+            // Assertions: releasing the process lock completes the pending timed acquisition.
+            assertTrue(result.get(2L, TimeUnit.SECONDS));
+        } finally {
+            if (processLock != null) {
+                processLock.close();
+            }
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(1L, TimeUnit.SECONDS));
         }
     }
 
@@ -850,7 +964,7 @@ class ReadWriteFileLockTest {
 
             processLock.close();
 
-            // Assertions: native blocking acquisition completes after the process lock is released.
+            // Assertions: asynchronous blocking acquisition completes after the process lock is released.
             assertTrue(result.get(2L, TimeUnit.SECONDS));
         } finally {
             executor.shutdownNow();

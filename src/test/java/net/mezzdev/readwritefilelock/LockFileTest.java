@@ -82,11 +82,12 @@ class LockFileTest {
         }
     }
 
-    @Test
+    @ParameterizedTest(name = "timed={0}")
+    @ValueSource(booleans = {false, true})
     @Timeout(value = 5L, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
-    void timedLockFallsBackForNonCooperatingSameJvmHolder() throws Exception {
+    void lockFallsBackForNonCooperatingSameJvmHolder(boolean timed) throws Exception {
         // Setup: a raw FileChannel holds the lock and cannot send this library's release notification.
-        Path lockFile = tempDir.resolve("non-cooperating.lock");
+        Path lockFile = tempDir.resolve(timed ? "timed-non-cooperating.lock" : "blocking-non-cooperating.lock");
         Files.createFile(lockFile);
         LockFile lock = new LockFile(lockFile);
         @SuppressWarnings("resource")
@@ -100,7 +101,9 @@ class LockFileTest {
         ) {
             Future<Boolean> result = executor.submit(() -> {
                 taskStarted.countDown();
-                LockFile.OpenFileLock heldLock = lock.tryLock(false, TimeUnit.SECONDS.toNanos(2L));
+                LockFile.OpenFileLock heldLock = timed
+                        ? lock.tryLock(false, TimeUnit.SECONDS.toNanos(2L))
+                        : lock.lock(false);
                 if (heldLock == null) {
                     return false;
                 }
@@ -167,7 +170,7 @@ class LockFileTest {
     }
 
     @Test
-    void blockingLockWaitsNativelyWhenProcessWinsJvmOverlapHandoff() throws Exception {
+    void blockingLockWaitsAsynchronouslyWhenProcessWinsJvmOverlapHandoff() throws Exception {
         // Setup: one same-JVM lock is held while a second LockFile prepares to wait for it.
         Path lockFile = tempDir.resolve("jvm-process-handoff.lock");
         LockFile first = new LockFile(lockFile);
@@ -195,7 +198,7 @@ class LockFileTest {
             // Assertions: the blocking waiter stays blocked while the process owns the file lock.
             assertFalse(acquired.await(100L, TimeUnit.MILLISECONDS));
 
-            // Operation: release the process lock so native FileChannel.lock() can complete.
+            // Operation: release the process lock so asynchronous file-lock acquisition can complete.
             processLock.close();
             processLock = null;
 

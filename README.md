@@ -62,11 +62,11 @@ system file lock. Readers in one classloader share the same process file lock,
 while the operating-system lock coordinates processes and isolated
 classloaders.
 
-Blocking acquisition waits interruptibly and uses `FileChannel.lock()` for
-cross-process contention without polling. Same-JVM file-lock overlap waits for
-a release notification, with a one-second fallback before retrying.
-Timed acquisition applies one timeout across both locking layers and uses
-exponential backoff when polling another process.
+Blocking and timed acquisition wait interruptibly on asynchronous file-lock
+operations, so cross-process contention does not require polling. Same-JVM
+file-lock overlap waits for a release notification, with a one-second fallback
+before retrying. Timed acquisition applies one timeout across both locking
+layers.
 
 ## Comparison with existing options
 
